@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
 <title>Risky Rocket</title>
+<script src="config.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
@@ -46,6 +47,7 @@ button:focus-visible,input:focus-visible{outline:3px dashed var(--fg);outline-of
 @keyframes flB{0%{opacity:0}50%{opacity:1}}
 .bigbtn{font-size:20px;padding:16px 38px}
 .tag{font-size:8px;line-height:1.8;color:var(--dim)}
+.tag.sel{-webkit-user-select:text;user-select:text;word-break:break-all}
 .blink{animation:blink 1s steps(1) infinite}
 @keyframes blink{50%{opacity:0}}
 @media (prefers-reduced-motion:reduce){.flameA,.flameB,.blink{animation:none}.flameB{opacity:0}}
@@ -86,7 +88,7 @@ button:focus-visible,input:focus-visible{outline:3px dashed var(--fg);outline-of
 #mult{font-size:clamp(14px,6.3vw,24px);line-height:1;text-shadow:0 0 6px #000,0 0 2px #000;white-space:nowrap}
 #mult.small{font-size:clamp(12px,4.4vw,16px)}
 #mult.crashed{color:var(--red)}
-#stat{font-size:8px;color:var(--dim);line-height:1.6;text-shadow:0 0 4px #000}
+#stat{font-size:8px;color:var(--dim);line-height:1.6;text-shadow:0 0 4px #000;white-space:pre-line;text-align:right}
 #banner{position:absolute;left:0;right:0;top:34%;text-align:center;pointer-events:none;text-shadow:0 0 8px #000,0 0 3px #000}
 #banner .big{font-size:56px;line-height:1}
 #banner .mid{font-size:16px;line-height:1.5}
@@ -121,6 +123,7 @@ button:focus-visible,input:focus-visible{outline:3px dashed var(--fg);outline-of
     <h1>RISKY<br>ROCKET</h1>
     <button id="play" class="bigbtn" type="button">PLAY</button>
     <div class="tag">1 TO 5 PLAYERS<br>PLAY CREDITS ONLY. NO REAL MONEY.</div>
+    <div class="tag" id="mpNote" style="color:var(--red)"></div>
   </section>
 
   <section id="deposit" class="screen">
@@ -128,6 +131,12 @@ button:focus-visible,input:focus-visible{outline:3px dashed var(--fg);outline-of
     <div class="field" id="nameField">
       <label for="depName">PILOT NAME</label>
       <input id="depName" maxlength="10" autocomplete="off" spellcheck="false" placeholder="NAME">
+    </div>
+    <div class="field" id="tableField">
+      <label for="depTable">TABLE CODE</label>
+      <input id="depTable" maxlength="12" autocomplete="off" spellcheck="false" placeholder="FRIENDS">
+      <div class="tag">EVERYONE WHO TYPES THE SAME CODE PLAYS THE SAME GAME.</div>
+      <div class="tag sel" id="depLink"></div>
     </div>
     <div class="field">
       <label>ADD CREDITS</label>
@@ -184,6 +193,10 @@ const MAX_MULT=1000;
 const MAX_PLAYERS=5, COUNT_MS=5000, HOLD_MS=4500;
 const MIN_BET=10, MAX_BET=100000;
 const LINE_OFF=58, SHAPE_N=5, BAND=140;
+/* Multiplayer needs a free Firebase Realtime Database. Its URL lives in config.js (see README). */
+const FIREBASE_URL=String(window.RR_FIREBASE_URL||'').trim();
+const fbConfigured=()=>/^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.(firebaseio\.com|firebasedatabase\.app)\/?$/i.test(FIREBASE_URL);
+const cleanTable=s=>String(s||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,12);
 const REDUCE=!!(window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches);
 
 const $=id=>document.getElementById(id);
@@ -197,7 +210,7 @@ function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}
 /* ================= state ================= */
 const S={
   name:'',credits:0,bet:100,shape:-1,st:'idle',jt:Date.now(),joined:false,inGame:false,
-  room:null,realRoom:false,named:[],players:[],iAmPlayer:false,amHost:false,wasHost:false,
+  room:null,realRoom:false,net:'',table:'MAIN',fbFailed:false,named:[],players:[],iAmPlayer:false,amHost:false,wasHost:false,
   hg:{ph:'lobby',rd:0},lastG:null,gKey:'0:lobby:0',
   phase:'lobby',rd:0,lr:0,ce:0,ab:false,ended:false,
   inR:false,roundBet:0,co:0,result:null,
@@ -254,13 +267,70 @@ function makeLocalRoom(){
     connected:()=>true
   };
 }
-async function initRoom(){
+async function loadFirebase(){
+  const base='https://www.gstatic.com/firebasejs/10.14.1/';
+  return Promise.all([import(base+'firebase-app.js'),import(base+'firebase-database.js')]);
+}
+/* Same room interface as above, but shared through Firebase Realtime Database. */
+async function makeFirebaseRoom(table){
+  const [appM,dbM]=await loadFirebase();
+  const db=dbM.getDatabase(appM.initializeApp({databaseURL:FIREBASE_URL}));
+  const id=Array.from(crypto.getRandomValues(new Uint8Array(5))).map(b=>b.toString(16).padStart(2,'0')).join('');
+  const root=dbM.ref(db,'rr/'+table+'/p'),mine=dbM.child(root,id);
+  const FRESH=40000;
+  let pres={},remote={},offset=0,online=false,lastSig='';
+  const hs=new Set();
+  const srvNow=()=>Date.now()+offset;
+  const list=()=>{
+    const now=srvNow(),all=Object.assign({},remote),out=[];
+    if(Object.keys(pres).length)all[id]=pres;
+    for(const k in all){
+      const v=all[k];if(!v||typeof v!=='object')continue;
+      if(k!==id&&v.hb&&now-v.hb>FRESH)continue;   // ignore players who went silent
+      out.push(Object.freeze({peer:k,by:null,isMe:k===id,sameTab:k===id,kind:'viewer',guest:false,presence:v,updatedAt:now}));
+    }
+    return out;
+  };
+  const emit=()=>{
+    const cur=list(),sig=cur.map(p=>p.peer+JSON.stringify(p.presence)).join('|');
+    if(sig===lastSig)return;lastSig=sig;
+    hs.forEach(h=>{try{h({peers:cur,joined:[],left:[],updated:[]});}catch(e){}});
+  };
+  dbM.onValue(dbM.ref(db,'.info/serverTimeOffset'),s=>{offset=+s.val()||0;});
+  dbM.onValue(dbM.ref(db,'.info/connected'),s=>{
+    online=s.val()===true;
+    if(online){dbM.onDisconnect(mine).remove();if(Object.keys(pres).length)dbM.set(mine,pres).catch(()=>{});}
+  });
+  await new Promise(res=>{
+    let done=false;const fin=()=>{if(!done){done=true;res();}};
+    dbM.onValue(root,s=>{remote=s.val()||{};delete remote[id];emit();fin();});
+    setTimeout(fin,6000);
+  });
+  setInterval(()=>{
+    if(Object.keys(pres).length){pres.hb=srvNow();dbM.update(mine,{hb:pres.hb}).catch(()=>{});}
+    emit();
+  },10000);
+  window.addEventListener('pagehide',()=>{try{dbM.remove(mine);}catch(e){}});
+  return{
+    peers:list,
+    presence(patch){
+      for(const k in patch){if(patch[k]===null)delete pres[k];else pres[k]=patch[k];}
+      pres.hb=srvNow();
+      queueMicrotask(emit);
+      return dbM.update(mine,Object.assign({},patch,{hb:pres.hb})).catch(()=>{});
+    },
+    onPeers(h){hs.add(h);queueMicrotask(()=>{try{h({peers:list(),joined:[],left:[],updated:[]});}catch(e){}});return()=>hs.delete(h);},
+    connected:()=>online
+  };
+}
+async function connectRoom(table){
   let room=null;
-  try{if(window.claude&&typeof window.claude.use==='function')room=await window.claude.use('room');}catch(e){room=null}
-  if(room){S.realRoom=true;}else{room=makeLocalRoom();S.realRoom=false;}
+  if(fbConfigured()){
+    try{room=await makeFirebaseRoom(table);S.realRoom=true;S.net='firebase';}catch(e){room=null;S.fbFailed=true;}
+  }
+  if(!room){room=makeLocalRoom();S.realRoom=false;S.net='local';}
   S.room=room;
 }
-const roomP=initRoom();
 function setP(patch){try{const p=S.room.presence(patch);if(p&&p.catch)p.catch(()=>{});}catch(e){}}
 
 /* ================= betting helpers ================= */
@@ -669,7 +739,10 @@ function renderUI(now){
   else if(S.phase==='lobby'){stat=ps.filter(p=>p.presence.st==='ready'||p.presence.st==='pass').length+'/'+ps.length+' SET';}
   else if(S.phase==='count')stat='LAUNCHING';
   else if(S.phase==='fly')stat=S.inR?(S.co>0?'CASHED OUT':'IN FLIGHT'):'WATCHING';
-  setText($('stat'),stat);
+  let net='';
+  if(S.net==='firebase')net=S.room.connected()?'TABLE '+S.table:'OFFLINE';
+  else if(S.net==='local')net=S.fbFailed?'NO CONNECTION - SOLO':'SOLO MODE';
+  setText($('stat'),[stat,net].filter(Boolean).join('\n'));
   setText($('credits'),'CR '+fmt(S.credits)+' +');
 
   /* banner */
@@ -745,6 +818,7 @@ requestAnimationFrame(frame);
 function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('active',s.id===id));}
 
 let depMode='start',depPick=1000;
+function updateLink(){const c=cleanTable($('depTable').value);$('depLink').textContent=c?'INVITE LINK: '+location.href.split('#')[0]+'#'+c:'';}
 function setChip(v){
   depPick=v;
   document.querySelectorAll('.chip').forEach(b=>b.classList.toggle('on',+b.dataset.v===v));
@@ -758,7 +832,10 @@ function openDeposit(mode){
   $('depGo').disabled=false;
   $('depErr').textContent='';$('depCustom').value='';
   $('depBal').textContent=S.credits>0?'BALANCE '+fmt(S.credits)+' CR. YOU CAN ADD 0 TO KEEP IT.':'';
+  $('tableField').style.display=mode==='start'?'':'none';
   if(mode==='start'&&!$('depName').value)$('depName').value=S.name||lsGet('rr_name')||'';
+  if(mode==='start'&&!$('depTable').value){let h='';try{h=decodeURIComponent((location.hash||'').slice(1));}catch(e){}$('depTable').value=cleanTable(h)||lsGet('rr_table')||'';}
+  updateLink();
   setChip(1000);show('deposit');
 }
 async function confirmDeposit(){
@@ -767,6 +844,7 @@ async function confirmDeposit(){
   if(depMode==='start'){
     name=$('depName').value.trim().replace(/\s+/g,' ').slice(0,10);
     if(!name){err.textContent='ENTER A NAME';return;}
+    S.table=cleanTable($('depTable').value)||'MAIN';lsSet('rr_table',S.table);
   }
   let amt=depPick;
   const cust=$('depCustom').value.trim();
@@ -780,7 +858,7 @@ async function confirmDeposit(){
 }
 async function enterGame(){
   const go=$('depGo');go.disabled=true;go.textContent='CONNECTING';
-  await roomP;
+  await connectRoom(S.table);
   S.joined=false;S.inGame=true;
   show('game');resize();clampBet();
   S.lastG={ph:'lobby',rd:0};
@@ -796,6 +874,7 @@ async function enterGame(){
 
 $('play').addEventListener('click',()=>openDeposit('start'));
 $('chips').addEventListener('click',e=>{const b=e.target.closest('.chip');if(!b)return;$('depCustom').value='';setChip(+b.dataset.v);});
+$('depTable').addEventListener('input',e=>{e.target.value=cleanTable(e.target.value);updateLink();});
 $('depCustom').addEventListener('input',e=>{e.target.value=e.target.value.replace(/\D/g,'');if(e.target.value)setChip(-1);});
 $('depGo').addEventListener('click',confirmDeposit);
 $('depBack').addEventListener('click',()=>show(depMode==='start'?'title':'game'));
@@ -812,6 +891,7 @@ function holdRepeat(btn,dir){
 holdRepeat($('betDown'),-1);holdRepeat($('betUp'),1);
 
 S.credits=parseInt(lsGet('rr_credits'),10)||0;
+if(!fbConfigured())$('mpNote').textContent='SOLO ONLY. ADD YOUR FIREBASE URL IN CONFIG.JS FOR MULTIPLAYER.';
 })();
 </script>
 </body>
